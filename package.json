@@ -1,0 +1,14 @@
+{
+  "name": "stm32l433-microvium-demo",
+  "private": true,
+  "version": "1.0.0",
+  "description": "Minimal STM32L433RC firmware + Microvium engine + JS agent demo (button -> timed LED)",
+  "scripts": {
+    "build": "make",
+    "flash": "make flash",
+    "clean": "make clean"
+  },
+  "devDependencies": {
+    "microvium": "^8.0.0"
+  }
+}
