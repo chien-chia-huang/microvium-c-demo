@@ -10,6 +10,12 @@ Usage:
 Only depends on the standard library (termios/tty -- macOS/Linux only,
 matching this project's other serial-console tooling; Windows users need a
 different serial layer, e.g. pyserial, to send the same framed bytes).
+
+Use the same device node your serial console (e.g. `screen`) already has
+open, not its paired alias -- on macOS, a USB-CDC port like usbmodem1403
+has both a /dev/tty.usbmodem1403 and /dev/cu.usbmodem1403 node for the same
+underlying device, and opening the *other* one concurrently can hang this
+script indefinitely on some driver/OS combinations.
 """
 import sys
 import subprocess
@@ -57,12 +63,6 @@ def main():
         sys.exit(f"usage: {sys.argv[0]} <serial-port> [input.mvm.js]")
     port = sys.argv[1]
     input_path = sys.argv[2] if len(sys.argv) == 3 else "js/agent.mvm.js"
-
-    if "/tty." in port:
-        cu_port = port.replace("/tty.", "/cu.")
-        print(f"Note: on macOS, /dev/cu.* (not /dev/tty.*) is the device node meant "
-              f"for one-shot outgoing writes like this. If sending doesn't work, "
-              f"try: {cu_port}", file=sys.stderr)
 
     bytecode = compile_bytecode(input_path)
     if len(bytecode) == 0 or len(bytecode) > MAX_SIZE:

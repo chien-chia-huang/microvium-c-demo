@@ -479,17 +479,21 @@ For quick JS-only iteration, a new bytecode image can be sent over the same
 serial console (above) instead of running `make flash` again:
 
 ```sh
-tools/send_bytecode.py /dev/cu.usbmodemXXXX          # compiles js/agent.mvm.js and sends it
-tools/send_bytecode.py /dev/cu.usbmodemXXXX path/to/other.mvm.js
+tools/send_bytecode.py /dev/tty.usbmodemXXXX          # compiles js/agent.mvm.js and sends it
+tools/send_bytecode.py /dev/tty.usbmodemXXXX path/to/other.mvm.js
 ```
 
-(Linux: `/dev/ttyACM0`. On macOS, use the `/dev/cu.*` node, not `/dev/tty.*`
--- `cu.*` is the convention for a one-shot outgoing write like this. The
-script only depends on the Python standard library -- no pyserial install
-needed -- but its serial setup uses `termios`, so it's macOS/Linux only.)
-You can leave your serial console (`screen`, above) open in another
-terminal at the same time -- the confirmation line below only shows up
-there.
+(Linux: `/dev/ttyACM0`. The script only depends on the Python standard
+library -- no pyserial install needed -- but its serial setup uses
+`termios`, so it's macOS/Linux only.) You can leave your serial console
+(`screen`, above) open in another terminal at the same time -- the
+confirmation line below only shows up there -- but use the **same** device
+node your `screen` session has open, not its paired alias. On macOS, a
+USB-CDC port like `usbmodem1403` exposes both a `/dev/tty.usbmodem1403` and
+a `/dev/cu.usbmodem1403` node for the same underlying device; opening the
+other one concurrently from this script can hang it indefinitely on some
+driver/OS combinations, even though `cu.*` is the usual macOS convention
+for a one-shot outgoing write like this one.
 
 This compiles the given `.mvm.js` file exactly as `tools/gen_bytecode_header.sh`
 does (leaving the raw compiled bytecode at `build/agent_upload.mvm` so you
