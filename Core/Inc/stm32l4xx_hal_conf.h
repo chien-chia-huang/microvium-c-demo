@@ -26,6 +26,9 @@ extern "C" {
  * be enabled+compiled for the header to parse, but stm32l4xx_hal_dma.c is
  * never actually exercised at runtime. */
 #define HAL_DMA_MODULE_ENABLED
+/* TIM6 is used as the 1ms HAL tick source once FreeRTOS is running, since
+ * FreeRTOS itself owns SysTick -- see Core/Src/stm32l4xx_hal_timebase_tim.c. */
+#define HAL_TIM_MODULE_ENABLED
 
 /* ########################## Oscillator Values adaptation ####################*/
 #if !defined (HSE_VALUE)
@@ -99,6 +102,10 @@ extern "C" {
 
 #ifdef HAL_UART_MODULE_ENABLED
   #include "stm32l4xx_hal_uart.h"
+#endif
+
+#ifdef HAL_TIM_MODULE_ENABLED
+  #include "stm32l4xx_hal_tim.h"
 #endif
 
 /* Exported macro ------------------------------------------------------------*/

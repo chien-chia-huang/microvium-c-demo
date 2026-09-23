@@ -2,14 +2,20 @@
  * main.c
  *
  * C-side responsibilities only (per project scope): bring up the clock,
- * configure the B1/LED GPIOs, start the Microvium VM, and drive it with a
- * fixed-period tick. All "how long should the LED stay lit" decision logic
- * lives in js/agent.mvm.js -- see mvm_host.c for the C<->JS boundary.
+ * configure the B1/LED GPIOs, and hand off to FreeRTOS. The Microvium VM
+ * itself is created lazily on the first button press and freed again once
+ * its countdown ends -- see mvm_host_process() in mvm_host.c. All "how long
+ * should the LED stay lit" decision logic lives in js/agent.mvm.js -- see
+ * mvm_host.c for the C<->JS boundary, and app_tasks.c for the two tasks
+ * that drive it.
  */
 #include "main.h"
 #include "mvm_host.h"
+#include "app_tasks.h"
 #include "debug_uart.h"
-#include <stdio.h>
+
+#include "FreeRTOS.h"
+#include "task.h"
 
 static void SystemClock_Config(void);
 static void MX_GPIO_Init(void);
@@ -22,23 +28,39 @@ int main(void)
   MX_GPIO_Init();
   Debug_UART_Init();
 
-  printf("\r\n\r\n=== STM32L433RC + Microvium button/LED demo booting ===\r\n");
-  printf("SystemCoreClock = %lu Hz\r\n", (unsigned long)SystemCoreClock);
+  Debug_Printf("\r\n\r\n=== STM32L433RC + Microvium button/LED demo booting ===\r\n");
+  Debug_Printf("SystemCoreClock = %lu Hz\r\n", (unsigned long)SystemCoreClock);
 
+  /*
+   * LedSelfTest() must run before any FreeRTOS object (mutex/queue/task) is
+   * created -- it's the last code that depends on HAL_Delay(), which needs
+   * the TIM6 tick interrupt to still be able to fire. Creating a FreeRTOS
+   * object before vTaskStartScheduler() has a real side effect on this
+   * port: it permanently masks interrupts until the scheduler actually
+   * starts (see the comment on Debug_UART_EnableThreadSafety() in
+   * debug_uart.c for the full mechanism). That's invisible in the usual
+   * FreeRTOS pattern -- create everything, immediately start the scheduler
+   * -- but not if anything in between still needs an interrupt to make
+   * progress, like this does.
+   */
   LedSelfTest();
 
-  mvm_host_init();
-  printf("Entering main loop (tick every %ums)\r\n", (unsigned)APP_TICK_INTERVAL_MS);
+  Debug_UART_EnableThreadSafety();
+  /* No mvm_host_init() here -- the VM task creates the VM lazily on the
+   * first button press instead of at boot; see mvm_host_process() in
+   * Core/Src/mvm_host.c. */
+  App_StartTasks();
 
-  uint32_t lastTick = HAL_GetTick();
+  Debug_Printf("Starting FreeRTOS scheduler...\r\n");
+  vTaskStartScheduler();
+
+  /* vTaskStartScheduler() only returns if it couldn't start (e.g. out of
+   * heap for the idle/timer task) -- should never happen with the RAM
+   * budget in FreeRTOSConfig.h, but fail loudly if it ever does. */
+  Debug_Printf("vTaskStartScheduler() returned unexpectedly!\r\n");
+  Error_Handler();
   for (;;)
   {
-    uint32_t now = HAL_GetTick();
-    if ((uint32_t)(now - lastTick) >= APP_TICK_INTERVAL_MS)
-    {
-      lastTick += APP_TICK_INTERVAL_MS;
-      mvm_host_tick(now);
-    }
   }
 }
 
@@ -50,7 +72,7 @@ int main(void)
  */
 static void LedSelfTest(void)
 {
-  printf("LED self-test: blinking LD4 (PB13) 3x...\r\n");
+  Debug_Printf("LED self-test: blinking LD4 (PB13) 3x...\r\n");
   for (int i = 0; i < 3; i++)
   {
     HAL_GPIO_WritePin(APP_LED_GPIO_PORT, APP_LED_GPIO_PIN, GPIO_PIN_SET);
@@ -58,7 +80,7 @@ static void LedSelfTest(void)
     HAL_GPIO_WritePin(APP_LED_GPIO_PORT, APP_LED_GPIO_PIN, GPIO_PIN_RESET);
     HAL_Delay(150);
   }
-  printf("LED self-test done.\r\n");
+  Debug_Printf("LED self-test done.\r\n");
 }
 
 /**
@@ -116,7 +138,13 @@ static void MX_GPIO_Init(void)
 
   GPIO_InitStruct.Pin = APP_BUTTON_GPIO_PIN;
   GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
-  /* The board has an external pull-up on B1, so no internal pull is needed. */
+  /* GPIO_NOPULL: verified empirically to be the setting that actually
+   * detects real presses on this board (see app_config.h). GPIO_PULLUP
+   * was also tried -- it stopped B1 from registering presses at all, which
+   * means the press path has enough series resistance that stacking the
+   * MCU's internal pull-up on top keeps the pin above the input-low
+   * threshold even while pressed. Don't add a pull here without re-testing
+   * an actual press/release on hardware afterward. */
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   HAL_GPIO_Init(APP_BUTTON_GPIO_PORT, &GPIO_InitStruct);
 
@@ -129,7 +157,7 @@ static void MX_GPIO_Init(void)
 
 void Error_Handler(void)
 {
-  printf("*** Error_Handler() called -- firmware halted. ***\r\n");
+  Debug_Printf("*** Error_Handler() called -- firmware halted. ***\r\n");
   __disable_irq();
   while (1)
   {

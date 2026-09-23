@@ -6,3 +6,5 @@ package-lock.json
 *.bin
 *.hex
 *.map
+__pycache__/
+*.pyc

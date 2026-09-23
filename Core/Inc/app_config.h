@@ -12,7 +12,15 @@
  *   MCU:      STM32L433RCT6P   (LQFP64, 256KB flash, 64KB SRAM)
  *
  *   B1 (user button): PC13, active LOW (pressed = electrical low), with an
- *                      external pull-up already on the board.
+ *                      external pull-up on the board -- but a comparatively
+ *                      weak/high-value one (plausible on this "-P"
+ *                      low-power variant, to minimize idle leakage during
+ *                      IDD measurement). GPIO_NOPULL is required in
+ *                      MX_GPIO_Init() (main.c): adding the MCU's internal
+ *                      pull-up on top was tried and empirically stops real
+ *                      presses from registering at all -- it's strong
+ *                      enough to also beat whatever series resistance is in
+ *                      B1's press path, not just the external pull-up.
  *
  *   LD4 (user LED):   PB13. Labelled LD4 on this board's silkscreen (LD3 is
  *                      the separate power/overcurrent indicator).
@@ -43,3 +51,13 @@
  * debounce, which is comfortably more than typical mechanical bounce time.
  */
 #define APP_BUTTON_DEBOUNCE_SAMPLES  2u
+
+/*
+ * How long after boot (measured from HAL_GetTick()==0) to ignore B1
+ * readings entirely. PC13 takes a real RC settle time to reach a valid
+ * HIGH level after MX_GPIO_Init() switches it to a digital input -- see
+ * the comment on mvm_host_poll_button() in mvm_host.c. Chosen comfortably
+ * past the ~900ms LedSelfTest() delay plus the observed settle time, with
+ * margin.
+ */
+#define APP_BUTTON_STARTUP_GRACE_MS  2000u

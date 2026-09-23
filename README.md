@@ -10,10 +10,32 @@ firmware only ever touches raw GPIOs and a millisecond clock.
 
 - **Board:** NUCLEO-L433RC-P (Nucleo-64-P, MB1319)
 - **MCU:** STM32L433RCT6P (LQFP64 package, 256KB flash, 64KB SRAM)
-- **B1 (user button):** PC13, active LOW (pressed = electrical low), external pull-up on the board.
+- **B1 (user button):** PC13, active LOW (pressed = electrical low). External
+  pull-up on the board, but a comparatively weak/high-value one (plausible
+  on this "-P" low-power variant, to minimize idle leakage during IDD
+  measurement) -- `GPIO_NOPULL` is required; adding the MCU's internal
+  pull-up on top empirically stops real presses from registering at all.
 - **LD4 (user LED):** PB13. Labelled LD4 on this board's silkscreen (LD3 is the separate power/overcurrent indicator).
 
 See `Core/Inc/app_config.h` for the pin definitions.
+
+### B1 needs a startup grace period
+
+PC13 reads an indeterminate/LOW level for the first couple of seconds after
+boot -- consistent with a real RC settle time through that same weak
+pull-up (plausibly paired with a hardware debounce cap on this board),
+after `MX_GPIO_Init()` switches the pin from its reset-default analog state
+to a digital input. Left unhandled, this reads as a false button press the
+instant the FreeRTOS scheduler starts.
+
+`mvm_host_poll_button()` (`Core/Src/mvm_host.c`) ignores all button
+readings -- without feeding them into the debounce state machine, so it
+starts learning the real state from a clean slate afterward -- until
+`APP_BUTTON_STARTUP_GRACE_MS` (`Core/Inc/app_config.h`, currently 2000ms)
+has passed since boot. The raw `PC13 electrical level -> ...` log line
+still prints during this window (useful for diagnosing the settle time
+itself); `button PRESSED`/`released` transitions and the debounced state
+fed to the VM task do not appear until the grace period ends.
 
 ## Toolchain
 
@@ -69,32 +91,152 @@ Host functions (C, called from JS via `vmImport`), see `Core/Src/mvm_host.c`:
 
 | ID | Name | Signature | Notes |
 |---|---|---|---|
-| 1 | `readButton` | `() -> 0/1` | Debounced B1 state. Exposed for future on-demand polling; the main loop already hands `onTick()` a fresh reading each tick (see below), so it isn't called from the tick path itself. |
-| 2 | `setLed` | `(state) -> undefined` | Raw LED GPIO write. |
+| 1 | `readButton` | `() -> 0/1` | Debounced B1 state. Exposed for future on-demand polling; `onTick()` already receives a fresh reading as an argument every tick (see below), so it isn't called from that path itself. |
+| 2 | `setLed` | `(state) -> undefined` | Raw LED GPIO write. **Actively called by JS** (`onTick()`) whenever it decides the LED should turn on or off -- this is JS reaching back into C mid-call, not C decoding a return value afterward. See `host_setLed()` in `mvm_host.c`. |
 | 3 | `getTime` | `() -> ms` | `HAL_GetTick()`, milliseconds since boot. |
+| 4 | `getPressCount` | `() -> count` | Reads `s_pressCount`, a counter C increments on every rising edge. **Called by JS** (`onTick()`, once per new press) to demonstrate the reverse of `setLed()` -- JS reading a value C owns, instead of writing one. Logged in `host_getPressCount()` in `mvm_host.c`. |
 
 Export (JS, called from C via `mvm_call`), see `js/agent.mvm.js`:
 
 | ID | Name | Signature | Notes |
 |---|---|---|---|
-| 100 | `onTick` | `(nowMs, buttonState) -> actionCode` | Called every 10ms (`APP_TICK_INTERVAL_MS`). Returns `0`=no change, `1`=turn LED on, `2`=turn LED off. |
+| 100 | `onTick` | `(nowMs, buttonState) -> actionCode` | Called every 10ms (`APP_TICK_INTERVAL_MS`) while a VM exists (see "FreeRTOS: two tasks" below for when that is). Returns `0`=countdown finished, VM should be freed (`ACTION_DONE`), or `100+N`=still counting down, `N` seconds remaining (informational only). |
 
 The "should the LED be on" state machine (latch press time, compare against
 `LIGHT_DURATION_MS`) lives entirely in `onTick()` in JS -- C never computes
-a duration, it just forwards raw readings and applies the returned action.
+a duration. Two different directions cross the C/JS boundary here: C calls
+JS every tick (`mvm_call(onTick)`), and JS calls back into C mid-tick
+(`setLed()`) to actually drive the LED. `onTick()`'s return value carries
+only the one decision JS *can't* make for itself -- whether to free its own
+VM -- since it can't call `mvm_free()` on itself while still running.
+
+### Which direction is "export" and which is "import"?
+
+Both terms describe the relationship from the VM's point of view, not the
+host's:
+
+- **Export** = something the VM exposes outward, for the host to call.
+  `onTick` is written in JS and exported by the VM (`vmExport()` in
+  `agent.mvm.js`); C calls it via `mvm_call()`. Direction: host -> VM.
+- **Import** = something the VM pulls in from outside, supplied by the
+  host. `readButton`/`setLed`/`getTime` are written in C, and the VM
+  imports them (`vmImport()` in `agent.mvm.js`) so JS code can call them.
+  Direction: VM -> host.
+
+Think of the bytecode compiled from `agent.mvm.js` as a module with two
+tables: one for "what this module exposes to the outside" (exports --
+`onTick` is on it), and one for "what this module needs supplied to run"
+(imports -- `readButton`/`setLed`/`getTime` are on it). This is the same
+import/export concept as any other language: writing `export function
+onTick(...)` would mean exactly this. The host itself has no import/export
+of its own -- it only calls the VM's exports and supplies implementations
+for the VM's imports. The vocabulary is centered on the VM, not on the host:
+
+| Who defines it | Who calls it | What it's called |
+|---|---|---|
+| VM (JS) defines `onTick` | Host (C) calls it | `onTick` is a VM **export** |
+| Host (C) defines `setLed`/`readButton`/`getTime` | VM (JS) calls them | These are VM **imports** (host supplies the implementation) |
+
+## FreeRTOS: two tasks, VM created and freed per press
+
+The C side and the Microvium VM run as two separate FreeRTOS tasks rather
+than one bare-metal loop:
+
+- **GPIO task** (`vGpioTask`, `Core/Src/app_tasks.c`, priority 2): every
+  `APP_TICK_INTERVAL_MS`, debounces + reads B1 (`mvm_host_poll_button()` in
+  `Core/Src/mvm_host.c`) and notifies the VM task with the result
+  (`xTaskNotify(..., eSetValueWithOverwrite)`). Knows nothing about
+  Microvium -- free-running regardless of whether a VM exists.
+- **VM task** (`vMvmTask`, same file, priority 1): blocks on
+  `xTaskNotifyWait()`; for each notification it gets, calls
+  `mvm_host_process()` (`Core/Src/mvm_host.c`) with the notified button
+  state and a fresh `HAL_GetTick()` reading.
+
+They're connected by a direct task notification rather than a queue --
+no queue object to create, no struct to pass by pointer. `buttonState`
+travels as the notification's own 32-bit value; `eSetValueWithOverwrite`
+always replaces whatever's still pending, so the VM task only ever sees
+the *latest* reading, never a backlog. The timestamp isn't carried in the
+notification at all: the VM task just reads `HAL_GetTick()` itself right
+after waking, which is close enough (a fraction of a millisecond) since it
+wakes essentially immediately once notified.
+
+### The VM only exists while a press is being timed
+
+Unlike a design where the VM is restored once at boot and runs forever,
+`mvm_host_process()` here creates and frees it around each button press:
+
+- While no VM exists, it just checks `buttonState`. Nothing happens until
+  a press comes in.
+- On the first reading that shows a press with no VM running, it prints
+  `[JS task] button pressed -- starting Microvium VM`, then calls
+  `mvm_restore()` + `mvm_resolveExports()` (`mvm_host_init()`) to create a
+  fresh instance -- as if the firmware had just booted -- and immediately
+  calls `onTick()` with that same reading.
+- For every following reading, it calls `onTick()` again. `js/agent.mvm.js`
+  encodes "still counting down, N seconds remaining" as
+  `ACTION_COUNTDOWN_BASE + N` (see `mvm_host.h`); C decodes that and
+  prints `[JS task] countdown: N s remaining` once per second (only when N
+  actually changes, not every 10ms tick) -- it never needs to know
+  `LIGHT_DURATION_MS` itself, just how to display whatever `agent.mvm.js`
+  computed.
+- Once `onTick()` returns `ACTION_DONE` (the countdown reached zero -- and
+  `onTick()` already called `setLed(false)` itself before returning), C
+  prints `[JS task] countdown finished -- ending Microvium VM` and calls
+  `mvm_free()` (`mvm_host_teardown()`) -- back to no VM existing at all,
+  until the next press repeats the whole cycle.
+
+This is safe without any extra locking: it all happens sequentially inside
+the single VM task, driven one notification at a time, so there's never a
+moment where two different pieces of code could be touching the VM at
+once.
+
+A few things worth knowing if you extend this:
+
+- **HAL's 1ms tick moved off SysTick, onto TIM6.** FreeRTOS needs SysTick
+  for its own scheduler tick, so `Core/Src/stm32l4xx_hal_timebase_tim.c`
+  (vendored from ST's own FreeRTOS example for the sibling NUCLEO-L452RE
+  board) overrides `HAL_InitTick()` to use TIM6 instead. `HAL_GetTick()`
+  works exactly as before; nothing else needed to change.
+- **The debug console got a mutex.** With two tasks logging independently,
+  a raw `printf()` could interleave characters from both tasks mid-line.
+  `Debug_Printf()` (`Core/Src/debug_uart.c`) holds a mutex for the whole
+  call so each log line comes out atomically; every log call site uses it
+  instead of `printf()` directly.
+- **Two independent allocators share the 64KB SRAM.** FreeRTOS's heap
+  (`configTOTAL_HEAP_SIZE` in `Core/Inc/FreeRTOSConfig.h`, currently 8KB,
+  via `heap_4`) and Microvium's heap (newlib `malloc` via `sbrk`, see
+  `third_party/microvium/microvium_port.h`) are completely separate and
+  don't know about each other -- both just need to fit in the same 64KB
+  budget. See `arm-none-eabi-size build/firmware.elf` for current numbers.
+- **No garbage collection is triggered anywhere.** Every `onTick()` call
+  boxes `nowMs` as a heap-allocated float64 once it's too large to pack
+  into a compact value, so a VM's heap usage grows slowly the longer it
+  runs (watch `mvm_getMemoryStats()` if you add long-running instrumentation).
+  In practice this doesn't matter here: each VM only lives for one
+  `LIGHT_DURATION_MS` countdown before being freed and replaced by a
+  completely fresh instance on the next press, well before that growth
+  could approach `MVM_MAX_HEAP_SIZE` (`microvium_port.h`).
+- **FreeRTOS was vendored from the same local STM32Cube_FW_L4 package** as
+  everything else (`Middlewares/Third_Party/FreeRTOS`), not downloaded
+  separately -- see `third_party/FreeRTOS/`.
 
 ## File structure
 
 ```
-Core/Inc/            app_config.h (pins/timing), main.h, mvm_host.h, debug_uart.h, HAL config, IRQ headers
-Core/Src/             main.c (clock+GPIO init, boot self-test, main loop), mvm_host.c (VM glue + host fns + logging),
-                      debug_uart.c (USART2 console + printf retarget),
+Core/Inc/            app_config.h (pins/timing), main.h, mvm_host.h, app_tasks.h, debug_uart.h,
+                      FreeRTOSConfig.h, HAL config, IRQ headers
+Core/Src/             main.c (clock+GPIO init, boot self-test, starts scheduler),
+                      app_tasks.c (the two FreeRTOS tasks), mvm_host.c (VM glue + host fns + logging),
+                      debug_uart.c (USART2 console + thread-safe printf retarget),
+                      stm32l4xx_hal_timebase_tim.c (TIM6 as HAL tick, freeing SysTick for FreeRTOS),
                       stm32l4xx_it.c/hal_msp.c (vendored), syscalls.c/sysmem.c (newlib stubs)
 Drivers/CMSIS/        ARM CMSIS core + ST device headers/system file (vendored)
-Drivers/STM32L4xx_HAL_Driver/   HAL modules actually used: RCC, GPIO, CORTEX, PWR, FLASH, DMA (header dep. of UART only), UART
+Drivers/STM32L4xx_HAL_Driver/   HAL modules actually used: RCC, GPIO, CORTEX, PWR, FLASH, DMA (header dep. of UART only), UART, TIM
 startup/              startup_stm32l433xx.s (reset handler + vector table)
 linker/               STM32L433RCTX_FLASH.ld (256K flash / 64K RAM)
 third_party/microvium/  microvium.c/.h (generated engine), microvium_port.h (customized)
+third_party/FreeRTOS/  vendored FreeRTOS kernel + ARM_CM4F port + heap_4 (see "FreeRTOS: two tasks")
 js/agent.mvm.js       the JS state machine (edit this to change behaviour)
 tools/gen_bytecode_header.sh   compiles agent.mvm.js -> build/agent_bytecode.h
 build/                generated: .o/.elf/.bin/.hex/.map + agent_bytecode.h (gitignored)
@@ -121,18 +263,19 @@ Expected output ends with a size summary, e.g.:
 
 ```
    text    data     bss     dec     hex filename
-  43536     132    1756   45424    b170 build/firmware.elf
+  50552     136   10312   61000    ee48 build/firmware.elf
 ```
 
 (The Docker build uses a newer `arm-none-eabi-gcc`, 10.3.1 vs. the host's
-9.3.1, so its size numbers differ slightly -- e.g. `46640` bytes of `text`
-instead of `43536`. Same source, same functionality either way.)
+9.3.1, so its size numbers differ slightly -- e.g. `53720` bytes of `text`
+instead of `50552`. Same source, same functionality either way.)
 
 `text` (code + constants, goes in flash) must stay under 256K; `data+bss`
-(static RAM) plus the VM heap/stack (see the sizing note in
-`third_party/microvium/microvium_port.h`) plus the 1KB main stack must stay
-under 64K. There's ample headroom for this demo (currently ~1.7KB of the
-64KB SRAM budget).
+(static RAM -- now including FreeRTOS's 8KB heap and both task stacks, see
+"FreeRTOS: two tasks" above) plus Microvium's own heap (see the sizing note
+in `third_party/microvium/microvium_port.h`) must stay under 64K. There's
+still ample headroom for this demo (currently ~10.2KB of the 64KB SRAM
+budget).
 
 Editing `js/agent.mvm.js` and re-running `make` (or `make docker-build`)
 automatically recompiles the bytecode and relinks the firmware -- no manual
@@ -206,40 +349,56 @@ screen /dev/tty.usbmodemXXXX 115200
 (Linux: `/dev/ttyACM0`. Windows: PuTTY/Tera Term, matching COM port, 115200
 8N1. Exit `screen` with `Ctrl-A` then `k`, then `y`.)
 
-**Example log**, boot followed by one press-and-release and one
-press-and-hold-past-3-seconds:
+**Example log**, boot followed by one press-and-hold-past-3-seconds:
 
 ```
 === STM32L433RC + Microvium button/LED demo booting ===
 SystemCoreClock = 80000000 Hz
 LED self-test: blinking LD4 (PB13) 3x...
 LED self-test done.
-mvm_host_init: restoring 166 bytes of bytecode...
-mvm_host_init: VM ready, onTick exported OK.
-Entering main loop (tick every 10ms)
-[t=15462] PC13 electrical level -> HIGH
-[t=15472] button released
+Starting FreeRTOS scheduler...
+[t=1002] heartbeat: PC13=HIGH button=0
+[t=2002] heartbeat: PC13=HIGH button=0
 [t=15622] PC13 electrical level -> LOW
 [t=15632] button PRESSED
-[t=15632] onTick -> ACTION_LED_ON, driving PB13 high
-[t=16002] heartbeat: PC13=LOW button=1
-[t=17002] heartbeat: PC13=LOW button=1
-[t=18632] onTick -> ACTION_LED_OFF, driving PB13 low   <- exactly 3000ms after the press
-[t=19002] heartbeat: PC13=LOW button=1                 <- still held, LED correctly stays off
+[JS task] button pressed -- starting Microvium VM
+[JS task] restoring 222 bytes of bytecode...
+[JS task] VM ready, onTick exported OK.
+[JS task] getPressCount() -> 1
+[JS task] setLed(1) -- driving PB13 high
+[JS task] countdown: 3 s remaining
+[JS task] countdown: 2 s remaining
+[JS task] countdown: 1 s remaining
+[JS task] countdown: 0 s remaining
+[JS task] setLed(0) -- driving PB13 low
+[JS task] countdown finished -- ending Microvium VM
+[t=19002] heartbeat: PC13=LOW button=1                 <- still held, but no VM until next press
 [t=22312] PC13 electrical level -> HIGH
 [t=22322] button released
 ```
 
-Each line's meaning:
+Notice there's no `mvm_host_init`/VM-related output at all until the first
+press -- no VM exists until then. Each line's meaning:
 
 - `PC13 electrical level -> HIGH/LOW` -- the *raw, unfiltered* pin reading,
   logged before debounce or the active-low inversion. Useful for telling a
   genuine hardware/wiring problem apart from a software one.
 - `button PRESSED` / `button released` -- the debounced, logical state.
 - `heartbeat: PC13=... button=...` -- printed once a second so you can tell
-  the main loop is alive even when nothing else is happening.
-- `onTick -> ACTION_LED_ON/OFF` -- only printed when the JS state machine
-  actually changes the LED (see `js/agent.mvm.js`).
+  the GPIO task is alive even when nothing else is happening.
+- `[JS task] button pressed -- starting Microvium VM` / `restoring N
+  bytes...` / `VM ready, onTick exported OK.` -- the VM being created fresh
+  for this press (see "FreeRTOS: two tasks" above).
+- `[JS task] getPressCount() -> N` -- JS reading a value C owns
+  (`host_getPressCount()`), once per new press -- the reverse direction
+  from `setLed()` (see "Extending agent.mvm.js" below).
+- `[JS task] setLed(1/0) -- driving PB13 high/low` -- JS actively calling
+  back into C (`host_setLed()`) to drive the LED, only when it actually
+  changes (see `js/agent.mvm.js`).
+- `[JS task] countdown: N s remaining` -- printed once per second while
+  counting down (not every 10ms tick).
+- `[JS task] countdown finished -- ending Microvium VM` -- the VM being
+  freed again once the countdown reaches zero.
 - `mvm_restore failed: ...` / `mvm_resolveExports failed: ...` (not shown
   above; only appears on failure) -- printed with an `MVM_E_*` numeric code
   if the VM fails to start; cross-reference the `mvm_TeError` enum in
@@ -257,16 +416,122 @@ is in the raw GPIO layer, the VM/bytecode, or the JS state machine.
 3. Reset the board (press the black RESET button, or power-cycle).
 4. Press and hold B1 -- LD4 (the user LED on PB13; don't confuse it with
    LD3, the power/overcurrent indicator) should turn on immediately (within
-   one 10ms tick), and the console should print `button PRESSED` followed
-   by `ACTION_LED_ON`.
-5. Release B1 before 3 seconds are up -- the LED should stay on until
+   one 10ms tick), and the console should print `button PRESSED`, then
+   `[JS task] button pressed -- starting Microvium VM`, then
+   `setLed(1) -- driving PB13 high`.
+5. Release B1 before 3 seconds are up -- the LED should stay on, with
+   `[JS task] countdown: N s remaining` printed once per second, until
    3 seconds have elapsed since the press, then turn off automatically
-   (console: `ACTION_LED_OFF`).
+   (console: `setLed(0) -- driving PB13 low` followed by `countdown
+   finished -- ending Microvium VM`).
 6. Press and hold B1 for *longer* than 3 seconds -- the LED should still
    turn off at the 3-second mark even while still held (confirms the timer,
    not "button still down", drives the light).
 7. Press B1 again after the LED has gone off -- it should light again for
-   another full 3 seconds (confirms the state machine resets cleanly).
+   another full 3 seconds, with a fresh `button pressed -- starting
+   Microvium VM` / `restoring N bytes...` sequence in the console (confirms
+   the VM is genuinely re-created each time, not just reused).
 
 To change the duration, edit `LIGHT_DURATION_MS` in `js/agent.mvm.js` and
 re-run `make && make flash`.
+
+## Extending agent.mvm.js: adding a new host import
+
+A host import always touches three places, and all three must agree on the
+same numeric ID:
+
+1. `Core/Inc/mvm_host.h` -- add a new value to `mvm_host_function_id_t`.
+2. `Core/Src/mvm_host.c` -- implement the function (every host function has
+   the same signature: `mvm_TeError fn(mvm_VM *vm, mvm_HostFunctionID id,
+   mvm_Value *result, mvm_Value *args, uint8_t argCount)`), and register it
+   in the `switch` inside `resolveImport()`.
+3. `js/agent.mvm.js` -- declare `const ID_X = N;` and `var x =
+   vmImport(ID_X);`, using the same ID from step 1.
+
+`getPressCount` (ID 4) is exactly this pattern, already implemented as a
+worked example of the C -> JS read direction (the reverse of `setLed()`'s
+JS -> C write):
+
+- `mvm_host.c` keeps a `static uint32_t s_pressCount`, incremented once per
+  rising edge in `mvm_host_process()` (the same `isRisingEdge` check that
+  gates VM creation).
+- `host_getPressCount()` just returns that counter's current value via
+  `mvm_newNumber()`, and logs the read (`[JS task] getPressCount() -> N`)
+  so the call is visible on the console.
+- `agent.mvm.js` calls `getPressCount()` once per new press, in the same
+  `if (buttonState && !wasPressed)` block that already starts the
+  countdown window. Nothing in the LED logic depends on the result --
+  it's there purely to demonstrate the read.
+
+Value conversions to know when writing a host function: numbers cross via
+`mvm_newNumber()` / `mvm_toInt32()` / `mvm_toFloat64()`, booleans via
+`mvm_newBoolean()` / `mvm_toBool()`. Host-function IDs and export IDs are
+kept in separate numbering ranges by convention in this project (host
+functions start at 1, exports at 100) purely for readability -- Microvium
+itself doesn't require that split.
+
+After editing `agent.mvm.js`, just run `make` (or `make docker-build`)
+again -- the bytecode regenerates automatically (see "Building" above).
+
+## Updating agent.mvm.js without reflashing
+
+For quick JS-only iteration, a new bytecode image can be sent over the same
+serial console (above) instead of running `make flash` again:
+
+```sh
+tools/send_bytecode.py /dev/cu.usbmodemXXXX          # compiles js/agent.mvm.js and sends it
+tools/send_bytecode.py /dev/cu.usbmodemXXXX path/to/other.mvm.js
+```
+
+(Linux: `/dev/ttyACM0`. On macOS, use the `/dev/cu.*` node, not `/dev/tty.*`
+-- `cu.*` is the convention for a one-shot outgoing write like this. The
+script only depends on the Python standard library -- no pyserial install
+needed -- but its serial setup uses `termios`, so it's macOS/Linux only.)
+You can leave your serial console (`screen`, above) open in another
+terminal at the same time -- the confirmation line below only shows up
+there.
+
+This compiles the given `.mvm.js` file exactly as `tools/gen_bytecode_header.sh`
+does (leaving the raw compiled bytecode at `build/agent_upload.mvm` so you
+can inspect exactly what was sent, e.g. `xxd build/agent_upload.mvm`), then
+sends it framed per `Core/Inc/js_upload.h`'s wire format: `0xAA 0x55`, a
+little-endian uint16 length, the raw bytecode bytes, then a 1-byte
+checksum. `JsUpload_Poll()` (`Core/Src/js_upload.c`) drains this off the
+same UART once per tick (`app_tasks.c`'s GPIO task) and, once the checksum
+validates, commits it to a RAM buffer; `mvm_host_init()` (`mvm_host.c`)
+checks that buffer via `JsUpload_GetBytecode()` and uses it instead of the
+compiled-in `agent_bytecode[]` on the *next* button press.
+
+Reception is interrupt-driven (`USART2_IRQHandler()` in
+`Core/Src/debug_uart.c`), not polled, precisely because this UART has no RX
+FIFO -- just one byte of hardware buffering -- and `Debug_Printf()`'s
+`__io_putchar()` transmits blocking, character by character. A log line
+like the once-a-second heartbeat busy-waits the CPU for a few ms; without
+an interrupt capturing bytes into a software ring buffer the instant they
+arrive, any upload byte landing during that window would be silently lost
+to a hardware overrun the moment a second byte followed it, before
+anything ever got a chance to poll for it.
+
+That ring buffer is sized to hold a whole upload frame in one go (4096
+bytes, comfortably above `JS_UPLOAD_MAX_SIZE` plus framing overhead), not
+just a handful of bytes -- a whole frame typically arrives as one
+continuous burst (~114 bytes can land within a single `APP_TICK_INTERVAL_MS`
+polling period at 115200 baud), and a ring too small to hold it all would
+silently drop bytes mid-frame if the GPIO task's next `JsUpload_Poll()`
+call doesn't happen to land in time to drain it, truncating the frame with
+no error printed at all.
+
+Two things this deliberately does NOT handle, since it's meant for quick
+local iteration rather than a robust field update mechanism:
+
+- **An upload that arrives while a VM is active (mid-countdown) is
+  rejected**, not queued -- Microvium keeps referencing the buffer it was
+  given for the VM's whole lifetime rather than copying all of it up
+  front, so overwriting that buffer out from under a running VM would
+  corrupt it. Retry after the countdown ends (console prints `[upload] VM
+  currently active -- ignoring this upload...` if you catch it mid-press).
+- **It doesn't survive a reset** -- the uploaded image lives in RAM
+  (`JS_UPLOAD_MAX_SIZE`, currently 2048 bytes, in `Core/Inc/js_upload.h`),
+  not flash, so a reset/power-cycle goes back to whatever's compiled into
+  the firmware. Run `make && make flash` once you're happy with a change,
+  to make it permanent.

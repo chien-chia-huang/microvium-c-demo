@@ -21,6 +21,15 @@
 /* Includes ------------------------------------------------------------------*/
 #include "main.h"
 #include "stm32l4xx_it.h"
+#include "FreeRTOS.h"
+#include "task.h"
+
+/* Implemented in third_party/FreeRTOS/portable/GCC/ARM_CM4F/port.c; not
+ * declared in any FreeRTOS header because the "normal" way to wire this up
+ * is to #define xPortSysTickHandler to SysTick_Handler directly (see
+ * FreeRTOSConfig.h), which we deliberately don't do -- see the comment on
+ * SysTick_Handler below. */
+extern void xPortSysTickHandler(void);
 
 /** @addtogroup STM32L4xx_HAL_Examples
   * @{
@@ -103,14 +112,14 @@ void UsageFault_Handler(void)
   }
 }
 
-/**
-  * @brief  This function handles SVCall exception.
-  * @param  None
-  * @retval None
-  */
-void SVC_Handler(void)
-{
-}
+/*
+ * SVC_Handler and PendSV_Handler are intentionally NOT defined here: with
+ * FreeRTOS in the build, FreeRTOSConfig.h renames vPortSVCHandler/
+ * xPortPendSVHandler (in third_party/FreeRTOS/portable/GCC/ARM_CM4F/port.c)
+ * to exactly these names via preprocessor macros, so the real
+ * implementations come from there. Defining them here too would be a
+ * duplicate-symbol link error.
+ */
 
 /**
   * @brief  This function handles Debug Monitor exception.
@@ -122,22 +131,14 @@ void DebugMon_Handler(void)
 }
 
 /**
-  * @brief  This function handles PendSVC exception.
-  * @param  None
-  * @retval None
-  */
-void PendSV_Handler(void)
-{
-}
-
-/**
-  * @brief  This function handles SysTick Handler.
-  * @param  None
-  * @retval None
-  */
+ * SysTick now drives the FreeRTOS scheduler tick instead of HAL_IncTick():
+ * HAL's own 1ms tick comes from TIM6 instead (see
+ * Core/Src/stm32l4xx_hal_timebase_tim.c), so SysTick is free for
+ * FreeRTOS to own exclusively.
+ */
 void SysTick_Handler(void)
 {
-  HAL_IncTick();
+  xPortSysTickHandler();
 }
 
 /******************************************************************************/

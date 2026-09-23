@@ -39,6 +39,8 @@ INCLUDES   := \
   -IDrivers/CMSIS/Device/ST/STM32L4xx/Include \
   -IDrivers/STM32L4xx_HAL_Driver/Inc \
   -Ithird_party/microvium \
+  -Ithird_party/FreeRTOS/include \
+  -Ithird_party/FreeRTOS/portable/GCC/ARM_CM4F \
   -I$(BUILD_DIR)
 
 CFLAGS     := $(MCU_FLAGS) $(DEFS) $(INCLUDES) \
@@ -59,6 +61,9 @@ C_SOURCES := \
   Core/Src/stm32l4xx_hal_msp.c \
   Core/Src/mvm_host.c \
   Core/Src/debug_uart.c \
+  Core/Src/js_upload.c \
+  Core/Src/app_tasks.c \
+  Core/Src/stm32l4xx_hal_timebase_tim.c \
   Core/Src/syscalls.c \
   Core/Src/sysmem.c \
   Drivers/CMSIS/Device/ST/STM32L4xx/Source/Templates/system_stm32l4xx.c \
@@ -74,7 +79,14 @@ C_SOURCES := \
   Drivers/STM32L4xx_HAL_Driver/Src/stm32l4xx_hal_flash_ramfunc.c \
   Drivers/STM32L4xx_HAL_Driver/Src/stm32l4xx_hal_dma.c \
   Drivers/STM32L4xx_HAL_Driver/Src/stm32l4xx_hal_uart.c \
-  third_party/microvium/microvium.c
+  Drivers/STM32L4xx_HAL_Driver/Src/stm32l4xx_hal_tim.c \
+  Drivers/STM32L4xx_HAL_Driver/Src/stm32l4xx_hal_tim_ex.c \
+  third_party/microvium/microvium.c \
+  third_party/FreeRTOS/tasks.c \
+  third_party/FreeRTOS/list.c \
+  third_party/FreeRTOS/queue.c \
+  third_party/FreeRTOS/portable/GCC/ARM_CM4F/port.c \
+  third_party/FreeRTOS/portable/MemMang/heap_4.c
 
 ASM_SOURCES := startup/startup_stm32l433xx.s
 
